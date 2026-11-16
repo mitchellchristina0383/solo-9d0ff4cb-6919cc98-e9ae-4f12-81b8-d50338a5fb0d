@@ -99,9 +99,10 @@ function showMsg(text, ok) {
 
 function report(d) {
   if (!d || !d.status) { showMsg("操作失败", false); return; }
-  if (d.status === "ACKED") showMsg("已确认送达（回执 #" + (d.receipt_id ?? "?") + "）", true);
-  else if (d.status === "CONFLICT") showMsg("冲突：" + (d.last_error || "内容不一致"), false);
-  else if (d.status === "UNCERTAIN") showMsg("未拿到回执，状态=待核：" + (d.last_error || ""), false);
+  const note = d.note ? "；" + d.note : "";
+  if (d.status === "ACKED") showMsg("已确认送达（回执 #" + (d.receipt_id ?? "?") + "）" + note, true);
+  else if (d.status === "CONFLICT") showMsg("冲突：" + (d.last_error || "内容不一致") + note, false);
+  else if (d.status === "UNCERTAIN") showMsg("未拿到回执，状态=待核" + (d.last_error ? "：" + d.last_error : "") + note, false);
   else showMsg((d.note ? d.note + "；" : "") + "当前状态：" + (STATUS_LABEL[d.status] || d.status), true);
 }
 
@@ -112,14 +113,17 @@ async function load() {
   for (const n of (data.items || [])) {
     const tr = document.createElement("tr");
     const receipt = n.receipt_id ? "#" + n.receipt_id : "—";
+    const inFlight = Number(n.sending) > 0;
+    const statusText = (STATUS_LABEL[n.status] || n.status) + (inFlight ? " · 发送中…" : "");
+    const locked = n.status === "ACKED" || inFlight;
     tr.innerHTML =
       "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) + "</td>" +
       "<td>" + esc(n.result) + "</td>" +
-      '<td><span class="badge b-' + n.status + '">' + (STATUS_LABEL[n.status] || n.status) + "</span></td>" +
+      '<td><span class="badge b-' + n.status + '">' + statusText + "</span></td>" +
       "<td>" + n.attempt_count + "</td><td>" + receipt + "</td>" +
       '<td class="err-text">' + esc(n.last_error || "") + "</td>" +
       '<td class="muted">' + esc(n.updated_at || "") + "</td>" +
-      '<td><button class="small" data-act="send">发送/重试</button> ' +
+      '<td><button class="small" data-act="send"' + (locked ? " disabled" : "") + '>发送/重试</button> ' +
       '<button class="small ghost" data-act="reconcile">核对</button></td>';
     tr.querySelector('[data-act="send"]').onclick = async () => {
       report((await api(`/api/notifications/${n.id}/send`, { method: "POST" })).data); load();

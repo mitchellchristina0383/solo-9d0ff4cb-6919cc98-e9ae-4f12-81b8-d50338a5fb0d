@@ -13,6 +13,11 @@
   S9  接收端不可用 → 待核且不虚报成功（--lifecycle）
   S10 发送端重启（接收端停机中）→ 待核持久 → 恢复后凭回执补核（--lifecycle）
   S11 发送端重启（接收端正常）→ 启动自动核对凭回执结案（--lifecycle）
+  S12 慢回执期间核对先确认 → 随后发送超时返回，不得撤销确认（确认优先）
+  S13 发送在途且接收端尚未落账 → 核对“无记录”不得判可重发、不得回退
+  S14 较早发出的核对请求延迟返回“无记录” → 不得撤销已确认、不得清空回执号
+  S15 reconcile-all（等价启动核对）与在途发送交错 → 保持待核
+  S16 接收端失联 → 保持待核；恢复后继续核对可收敛到已确认
 
 用法：
   python3 tests/selftest.py [--lifecycle]
@@ -76,8 +81,15 @@ def sender_send(nid, simulate=None):
     return req("POST", url)
 
 
-def sender_reconcile(nid):
-    return req("POST", f"{SENDER}/api/notifications/{nid}/reconcile")
+def sender_reconcile(nid, delay=None):
+    url = f"{SENDER}/api/notifications/{nid}/reconcile"
+    if delay:
+        url += f"?delay={delay}"
+    return req("POST", url)
+
+
+def sender_reconcile_all():
+    return req("POST", SENDER + "/api/reconcile-all")
 
 
 def sender_rows(rel):
@@ -295,12 +307,148 @@ def s11_auto_reconcile_after_restart():
     check("S11 接收端仍仅一条", len(receiver_rows(k)) == 1)
 
 
+def s12_ack_wins_over_late_send():
+    """慢回执：核对先凭已入账回执确认，随后发送超时返回，不得撤销确认。"""
+    k = key("k12")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    result = {}
+
+    def do_send_slow():
+        result["send"] = sender_send(nid, simulate="slow")[1]
+
+    t = threading.Thread(target=do_send_slow)
+    t.start()
+    time.sleep(0.5)
+    code, r = sender_reconcile(nid)
+    check("S12 发送在途时核对仍凭回执确认", r.get("status") == "ACKED" and bool(r.get("receipt_id")), f"{r}")
+    t.join()
+    rows = sender_rows(k)
+    check("S12 慢发送超时返回后不撤销已确认",
+          bool(rows) and rows[0]["status"] == "ACKED" and bool(rows[0]["receipt_id"]), f"{rows} send={result.get('send')}")
+    check("S12 发送在途计数已释放", bool(rows) and rows[0]["sending"] == 0, f"{rows}")
+    check("S12 已确认行不残留错误", bool(rows) and not rows[0]["last_error"], f"{rows}")
+    check("S12 接收端仅一条", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+
+
+def s13_no_record_while_in_flight():
+    """接收端延迟落账：发送在途时核对到“无记录”，不得判可重发、不得回退待发送。"""
+    k = key("k13")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    result = {}
+
+    def do_send_slow_commit():
+        result["send"] = sender_send(nid, simulate="slow_commit")[1]
+
+    t = threading.Thread(target=do_send_slow_commit)
+    t.start()
+    time.sleep(1)
+    code, r = sender_reconcile(nid)
+    check("S13 发送在途时核对无记录仍保持待核",
+          r.get("status") == "UNCERTAIN", f"{r}")
+    check("S13 发送在途时不得提示可安全重发",
+          "可安全重发" not in (r.get("note") or ""), f"{r}")
+    t.join()  # 发送端 3s 超时返回
+    rows = sender_rows(k)
+    check("S13 发送超时后为待核且在途计数已释放",
+          bool(rows) and rows[0]["status"] == "UNCERTAIN" and rows[0]["sending"] == 0, f"{rows}")
+    time.sleep(4)  # 等接收端延迟落账完成（slow_commit 约 6s）
+    code, r2 = sender_reconcile(nid)
+    check("S13 接收端落账后核对收敛为已确认", r2.get("status") == "ACKED", f"{r2}")
+    check("S13 接收端仅一条", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+
+
+def s14_stale_no_record_cannot_revoke_ack():
+    """较早发出的核对请求延迟返回“无记录”：不得撤销已确认、不得清空回执号。"""
+    k = key("k14")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    sender_send(nid, simulate="lose_response")
+    check("S14 前置：丢回执后待核", sender_rows(k)[0]["status"] == "UNCERTAIN")
+    stale = {}
+
+    def do_stale_reconcile():
+        stale["resp"] = sender_reconcile(nid, delay=2)[1]
+
+    t = threading.Thread(target=do_stale_reconcile)
+    t.start()
+    time.sleep(0.5)
+    code, send_r = sender_send(nid)
+    check("S14 期间重发凭回执确认", send_r.get("status") == "ACKED", f"{send_r}")
+    t.join()  # 延迟的“无记录”在确认之后到达
+    check("S14 延迟核对响应仍返回已确认（不撤销）",
+          stale["resp"].get("status") == "ACKED", f"{stale}")
+    check("S14 延迟核对不得提示可安全重发",
+          "可安全重发" not in (stale["resp"].get("note") or ""), f"{stale}")
+    rows = sender_rows(k)
+    check("S14 已确认且回执号保留、无错误残留",
+          bool(rows) and rows[0]["status"] == "ACKED" and bool(rows[0]["receipt_id"])
+          and not rows[0]["last_error"], f"{rows}")
+    check("S14 接收端仅一条", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+
+
+def s15_reconcile_all_interleaved():
+    """核对全部（等价启动核对）与在途发送交错：无记录结论不落库，最终收敛。"""
+    k = key("k15")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    result = {}
+
+    def do_send_slow_commit():
+        result["send"] = sender_send(nid, simulate="slow_commit")[1]
+
+    t = threading.Thread(target=do_send_slow_commit)
+    t.start()
+    time.sleep(1)
+    sender_reconcile_all()
+    rows = sender_rows(k)
+    check("S15 核对全部与在途发送交错后仍为待核",
+          bool(rows) and rows[0]["status"] == "UNCERTAIN" and rows[0]["sending"] == 1, f"{rows}")
+    t.join()
+    time.sleep(4)
+    code, r2 = sender_reconcile_all()
+    rows = sender_rows(k)
+    check("S15 接收端落账后核对全部收敛为已确认",
+          bool(rows) and rows[0]["status"] == "ACKED", f"{rows}")
+    check("S15 接收端仅一条", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+
+
+def s16_receiver_outage_recovery():
+    """接收端失联：发送/核对都保持待核；恢复后继续核对可收敛。"""
+    k = key("k16")
+    hook("RN_HOOK_STOP_RECEIVER", "docker compose stop receiver")
+    time.sleep(1)
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    code, s = sender_send(nid)
+    check("S16 失联时发送保持待核", s.get("status") == "UNCERTAIN", f"{s}")
+    code, r = sender_reconcile(nid)
+    check("S16 失联时核对保持待核", r.get("status") == "UNCERTAIN", f"{r}")
+    rows = sender_rows(k)
+    check("S16 失联时在途计数不为负且无回执号",
+          bool(rows) and rows[0]["sending"] == 0 and rows[0]["receipt_id"] is None, f"{rows}")
+    hook("RN_HOOK_START_RECEIVER", "docker compose start receiver")
+    if not wait_up(RECEIVER):
+        check("S16 接收端恢复", False)
+        return
+    code, r2 = sender_reconcile(nid)
+    check("S16 恢复后核对判定未送达（回退待发送）", r2.get("status") == "PENDING", f"{r2}")
+    code, s2 = sender_send(nid)
+    check("S16 恢复后重发确认且接收端仅一条",
+          s2.get("status") == "ACKED" and len(receiver_rows(k)) == 1, f"{s2}")
+
+
 def main():
     lifecycle = "--lifecycle" in sys.argv or os.environ.get("RN_LIFECYCLE") == "1"
     print(f"发送端 {SENDER}  接收端 {RECEIVER}  lifecycle={lifecycle}", flush=True)
     if not wait_up(SENDER) or not wait_up(RECEIVER):
         print("服务未就绪，请先启动两端。")
         sys.exit(2)
+
+    # 发送端启动约 2s 后会做一次启动核对；等它跑完再开始，
+    # 避免它恰好核对到本次用例刚进入“待核”的记录（那属于合法的确认优先，不是失败）。
+    time.sleep(3)
 
     s1_basic()
     s2_retry_dedup()
@@ -310,10 +458,15 @@ def main():
     s6_slow_response()
     s7_concurrent_same()
     s8_concurrent_diff()
+    s12_ack_wins_over_late_send()
+    s13_no_record_while_in_flight()
+    s14_stale_no_record_cannot_revoke_ack()
+    s15_reconcile_all_interleaved()
     if lifecycle:
         nid_k9 = s9_receiver_down()
         s10_sender_restart_while_down(nid_k9)
         s11_auto_reconcile_after_restart()
+        s16_receiver_outage_recovery()
 
     print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:

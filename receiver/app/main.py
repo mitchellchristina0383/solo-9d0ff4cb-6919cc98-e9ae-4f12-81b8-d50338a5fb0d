@@ -3,7 +3,8 @@
 接收“部署完成通知”，按 (env, release_no) 幂等入库，并提供回执查询。
 - 相同 (env, release_no) 且内容一致的重试：返回既有回执，不新增记录；
 - 相同 (env, release_no) 但内容不同：409 冲突；
-- 故障注入（仅演示）：simulate=lose_response（入库后丢响应）/ slow（入库后慢响应）。
+- 故障注入（仅演示）：simulate=lose_response（入库后丢响应）/ slow（入库后慢响应）/
+  slow_commit（延迟入库，模拟发送端超时后接收端才落账）。
 """
 from __future__ import annotations
 
@@ -15,13 +16,15 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("DB_PATH", "/data/receiver.db")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-VALID_SIMULATE = {"lose_response", "slow"}
+VALID_SIMULATE = {"lose_response", "slow", "slow_commit"}
+SLOW_COMMIT_SECONDS = float(os.environ.get("SLOW_COMMIT_SECONDS", "6"))
+MAX_QUERY_DELAY = 10.0
 
 
 def now_iso() -> str:
@@ -88,7 +91,7 @@ class ReceiptIn(BaseModel):
     env: str
     release_no: str
     result: str
-    simulate: str | None = None  # lose_response | slow
+    simulate: str | None = None  # lose_response | slow | slow_commit
 
 
 @app.get("/api/health")
@@ -107,6 +110,9 @@ def create_receipt(body: ReceiptIn):
         return JSONResponse(status_code=400, content={"detail": f"simulate 仅支持：{sorted(VALID_SIMULATE)}"})
 
     ch = content_hash(env, release_no, result)
+    # —— 故障注入（仅演示）：延迟入库，模拟「发送端已超时、接收端稍后才落账」——
+    if body.simulate == "slow_commit":
+        time.sleep(SLOW_COMMIT_SECONDS)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -151,7 +157,10 @@ def create_receipt(body: ReceiptIn):
 
 
 @app.get("/api/receipts")
-def list_or_get_receipts(env: str | None = None, release_no: str | None = None):
+def list_or_get_receipts(env: str | None = None, release_no: str | None = None,
+                         delay: float | None = Query(default=None, ge=0)):
+    """查询回执。delay 仅用于演示/自测：先读取快照再延迟返回，
+    模拟“较早时刻读到的结果延迟到达调用方”的过期响应。"""
     conn = connect()
     try:
         if env is not None or release_no is not None:
@@ -160,11 +169,17 @@ def list_or_get_receipts(env: str | None = None, release_no: str | None = None):
             row = conn.execute(
                 "SELECT * FROM receipts WHERE env=? AND release_no=?", (env, release_no)
             ).fetchone()
-            if row is None:
+            payload = None if row is None else row_to_dict(row)
+            if delay:
+                time.sleep(min(delay, MAX_QUERY_DELAY))
+            if payload is None:
                 return JSONResponse(status_code=404, content={"detail": "无此记录"})
-            return row_to_dict(row)
+            return payload
         rows = conn.execute("SELECT * FROM receipts ORDER BY id DESC").fetchall()
-        return {"items": [row_to_dict(r) for r in rows]}
+        payload = {"items": [row_to_dict(r) for r in rows]}
+        if delay:
+            time.sleep(min(delay, MAX_QUERY_DELAY))
+        return payload
     finally:
         conn.close()
 
